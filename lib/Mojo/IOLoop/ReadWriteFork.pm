@@ -37,11 +37,8 @@ and STDOUT are more than welcome.
     $cat_result .= $buffer;
   });
 
-  $fork->start(
-    program => 'bash',
-    program_args => [ -c => 'echo $YIKES foo bar baz' ],
-    conduit => 'pty',
-  );
+  $ENV{VARIABLE} = '123';
+  $fork->run('bash', -c => 'echo $VARIABLE foo bar baz');
 
 =head2 In a Mojolicios::Controller
 
@@ -97,6 +94,14 @@ Emitted when the child has written a chunk of data to STDOUT or STDERR.
 
 =head1 ATTRIBUTES
 
+=head2 conduit
+
+  $any = $self->conduit;
+  $self = $self->conduit(IO::Pty->new);
+
+Either a L<IO::Pty> object or C<undef>. Default is C<undef>, which means
+use plain C<pipe()> instead of a terminal emulator.
+
 =head2 ioloop
 
   $ioloop = $self->ioloop;
@@ -115,6 +120,12 @@ Holds the child process ID.
 DEPRECATED.
 
 =cut
+
+sub conduit {
+  return shift->{conduit} if @_ == 1;
+  $_[0]->{conduit} = !$_[1] ? undef : $_[1] eq 'pty' ? IO::Pty->new : $_[1];
+  $_[0];
+}
 
 sub pid { shift->{pid} || 0; }
 has ioloop => sub { Mojo::IOLoop->singleton; };
@@ -140,9 +151,10 @@ sub close {
 
 =head2 run
 
-  $self = $self->run($program, @program_args);
+  $self = $self->run($executable, @command_line_args);
+  $self = $self->run(sub { @args = @_; }, @args);
 
-Simpler version of L</start>.
+Used to start a given program or run a code ref in a child process.
 
 =cut
 
@@ -155,23 +167,7 @@ sub run {
 
 =head2 start
 
-  $self->start(
-    program => sub { my @program_args = @_; ... },
-    program_args => [ @data ],
-  );
-
-  $self->start(
-    program => $str,
-    program_args => [@str],
-    conduit => $str, # pipe or pty
-    raw => $bool,
-    clone_winsize_from => \*STDIN,
-  );
-
-Used to fork and exec a child process.
-
-L<raw|IO::Pty> and C<clone_winsize_from|IO::Pty> only makes sense if
-C<conduit> is "pty".
+See L</run> instead.
 
 =cut
 
@@ -179,10 +175,13 @@ sub start {
   my $self = shift;
   my $args = ref $_[0] ? $_[0] : {@_};
 
+  if ($args->{conduit} and $args->{conduit} eq 'pty') {
+    $self->conduit(IO::Pty->new);
+  }
+
   $args->{env}   = {%ENV};
   $self->{errno} = 0;
   $args->{program} or die 'program is required input';
-  $args->{conduit} ||= 'pipe';
   $args->{program_args} ||= [];
   ref $args->{program_args} eq 'ARRAY' or die 'program_args need to be an array';
   Scalar::Util::weaken($self);
@@ -197,18 +196,18 @@ sub _start {
   my ($stdin_read,  $stdin_write);
   my ($errno,       $pid);
 
-  if ($args->{conduit} eq 'pipe') {
+  if (!$self->conduit) {
     pipe $stdout_read, $stdout_write or return $self->emit(error => "pipe: $!");
     pipe $stdin_read,  $stdin_write  or return $self->emit(error => "pipe: $!");
     select +(select($stdout_write), $| = 1)[0];
     select +(select($stdin_write),  $| = 1)[0];
   }
-  elsif ($args->{conduit} eq 'pty') {
-    $stdin_write = $stdout_read = IO::Pty->new;
+  elsif (UNIVERSAL::isa($self->conduit, 'IO::Pty')) {
+    $stdin_write = $stdout_read = $self->conduit;
   }
   else {
-    warn "Invalid conduit ($args->{conduit})\n" if DEBUG;
-    return $self->emit(error => "Invalid conduit ($args->{conduit})");
+    warn "Invalid conduit ($self->{conduit})\n" if DEBUG;
+    return $self->emit(error => "Invalid conduit ($self->{conduit})");
   }
 
   $pid = fork;
@@ -248,11 +247,11 @@ sub _start {
     $self->_write;
   }
   else {    # child ===========================================================
-    if ($args->{conduit} eq 'pty') {
-      $stdin_write->make_slave_controlling_terminal;
+    if (UNIVERSAL::isa($self->conduit, 'IO::Pty')) {
       $stdin_read = $stdout_write = $stdin_write->slave;
-      $stdin_read->set_raw if $args->{raw};
-      $stdin_read->clone_winsize_from($args->{clone_winsize_from}) if $args->{clone_winsize_from};
+      $stdin_write->make_slave_controlling_terminal;
+      $self->conduit->set_raw if $args->{raw};
+      $self->conduit->clone_winsize_from($args->{clone_winsize_from}) if $args->{clone_winsize_from};
     }
 
     warn "[$$] Starting $args->{program} @{ $args->{program_args} }\n" if DEBUG;
